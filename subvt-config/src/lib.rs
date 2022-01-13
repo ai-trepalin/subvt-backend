@@ -4,9 +4,9 @@ use serde::Deserialize;
 use std::fmt;
 
 /// Default development configuration file relative path for other SubVT crates/modules.
-const DEV_CONFIG_FILE_PATH: &str = "../subvt-config/config/Default.toml";
+const DEV_CONFIG_FILE_PATH: &str = "./modules/subvt-backend/subvt-config/config/Default.toml";
 /// Development configuration folder relative path for other SubVT crates/modules.
-const DEV_CONFIG_FILE_PREFIX: &str = "../subvt-config/config/";
+const DEV_CONFIG_FILE_PREFIX: &str = "./modules/subvt-backend/subvt-config/config/";
 /// Production default configuration file should reside in the folder `config` in the same
 /// folder as the final executable.
 const CONFIG_FILE_PATH: &str = "./config/Default.toml";
