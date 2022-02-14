@@ -119,16 +119,17 @@ impl BlockProcessor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn process_event(
         &self,
         substrate_client: &SubstrateClient,
         postgres: &PostgreSQLNetworkStorage,
-        block_hash_epoch_index: (&str, u64),
+        (block_hash, block_number, block_timestamp): (&str, u64, Option<u64>),
+        epoch_index: u64,
         successful_extrinsic_indices: &mut Vec<u32>,
         failed_extrinsic_indices: &mut Vec<u32>,
         (event_index, event): (usize, &SubstrateEvent),
     ) -> anyhow::Result<()> {
-        let (block_hash, epoch_index) = block_hash_epoch_index;
         match event {
             SubstrateEvent::ImOnline(im_online_event) => match im_online_event {
                 ImOnlineEvent::HeartbeatReceived {
@@ -275,9 +276,12 @@ impl BlockProcessor {
                 } => {
                     let extrinsic_index =
                         extrinsic_index.map(|extrinsic_index| extrinsic_index as i32);
+
                     postgres
                         .save_new_account_event(
                             block_hash,
+                            block_number,
+                            block_timestamp,
                             extrinsic_index,
                             event_index as i32,
                             account_id,
@@ -293,6 +297,8 @@ impl BlockProcessor {
                     postgres
                         .save_killed_account_event(
                             block_hash,
+                            block_number,
+                            block_timestamp,
                             extrinsic_index,
                             event_index as i32,
                             account_id,
@@ -815,19 +821,44 @@ impl BlockProcessor {
         let active_validator_account_ids = substrate_client
             .get_active_validator_account_ids(&block_hash)
             .await?;
-
         if last_epoch_index != current_epoch_index || last_era_index != active_era.index {
             let era_stakers = substrate_client
                 .get_era_stakers(&active_era, true, &block_hash)
                 .await?;
             if last_epoch_index != current_epoch_index {
-                debug!("New epoch. Persist era if it doesn't exist.");
+                debug!("New epoch. Persist epoch. Persist era if it doesn't exist.");
                 let total_stake = substrate_client
                     .get_era_total_stake(active_era.index, &block_hash)
                     .await?;
                 postgres
                     .save_era(&active_era, total_stake, &era_stakers)
                     .await?;
+                postgres
+                    .save_epoch(current_epoch_index, active_era.index)
+                    .await?;
+                // save session para validators
+                if let Some(para_validator_indices) = substrate_client
+                    .get_paras_active_validator_indices(&block_hash)
+                    .await?
+                {
+                    let para_validator_account_ids: Vec<&AccountId> = para_validator_indices
+                        .iter()
+                        .filter_map(|index| active_validator_account_ids.get(*index as usize))
+                        .collect();
+                    debug!(
+                        "Persist {} session para validators.",
+                        para_validator_account_ids.len()
+                    );
+                    postgres
+                        .save_session_para_validators(
+                            active_era.index,
+                            current_epoch_index,
+                            &para_validator_account_ids,
+                        )
+                        .await?;
+                } else {
+                    debug!("Parachains not active.");
+                }
             }
             if last_era_index != active_era.index {
                 let era_stakers = substrate_client
@@ -931,7 +962,8 @@ impl BlockProcessor {
             self.process_event(
                 substrate_client,
                 postgres,
-                (&block_hash, current_epoch_index),
+                (&block_hash, block_number, block_timestamp),
+                current_epoch_index,
                 &mut successful_extrinsic_indices,
                 &mut failed_extrinsic_indices,
                 (index, event),
@@ -997,10 +1029,10 @@ impl Service for BlockProcessor {
                             return;
                         }
                     };
-                    if ((processed_block_height + 1) as u64) < finalized_block_number {
+                    if processed_block_height < finalized_block_number {
                         is_indexing_past_blocks.store(true, Ordering::SeqCst);
                         let mut block_number = std::cmp::max(
-                            (processed_block_height + 1) as u64,
+                            processed_block_height,
                             CONFIG.block_processor.start_block_number
                         );
                         while block_number <= finalized_block_number {

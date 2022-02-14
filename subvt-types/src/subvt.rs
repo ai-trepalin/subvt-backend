@@ -3,6 +3,7 @@
 //! by other services that require it.
 
 use crate::crypto::AccountId;
+use crate::substrate::paras::ParaCoreAssignment;
 use crate::substrate::{
     Account, Balance, Epoch, Era, InactiveNominationsSummary, Nomination, RewardDestination, Stake,
     StakeSummary, ValidatorPreferences, ValidatorStake,
@@ -13,7 +14,7 @@ use subvt_proc_macro::Diff;
 
 /// Represents the network's status that changes with every block.
 #[derive(Clone, Debug, Diff, Default, Deserialize, Serialize)]
-pub struct LiveNetworkStatus {
+pub struct NetworkStatus {
     pub finalized_block_number: u64,
     pub finalized_block_hash: String,
     pub best_block_number: u64,
@@ -33,14 +34,14 @@ pub struct LiveNetworkStatus {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
-pub struct LiveNetworkStatusUpdate {
+pub struct NetworkStatusUpdate {
     pub network: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<LiveNetworkStatus>,
+    pub status: Option<NetworkStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff_base_block_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub diff: Option<LiveNetworkStatusDiff>,
+    pub diff: Option<NetworkStatusDiff>,
 }
 
 /// Represents an inactive validator, waiting to be in the active set.
@@ -63,8 +64,9 @@ pub struct ValidatorDetails {
     pub offline_offence_count: u64,
     pub total_reward_points: u64,
     pub unclaimed_era_indices: Vec<u32>,
+    pub is_para_validator: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_parachain_validator: Option<bool>,
+    pub para_core_assignment: Option<ParaCoreAssignment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_rate_per_billion: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -103,8 +105,9 @@ pub struct ValidatorSummary {
     pub oversubscribed: bool,
     pub slash_count: u64,
     pub is_enrolled_in_1kv: bool,
+    pub is_para_validator: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_parachain_validator: Option<bool>,
+    pub para_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_rate_per_billion: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,7 +171,11 @@ impl From<&ValidatorDetails> for ValidatorSummary {
             preferences: validator.preferences.clone(),
             self_stake: StakeSummary::from(&validator.self_stake),
             is_active: validator.is_active,
-            is_parachain_validator: validator.is_parachain_validator,
+            is_para_validator: validator.is_para_validator,
+            para_id: validator
+                .para_core_assignment
+                .as_ref()
+                .map(|core_assignment| core_assignment.para_id),
             active_next_session: validator.active_next_session,
             inactive_nominations: InactiveNominationsSummary::from(&inactive_nominations),
             oversubscribed: validator.oversubscribed,

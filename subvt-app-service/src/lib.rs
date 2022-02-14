@@ -1,8 +1,9 @@
 //! Application REST interface. Contains services such as user registration, network list,
 //! notification channels, user validator registration, user notification rules persistence
 //! and deletion, etc.
+use crate::auth::{data::AuthenticatedUser, service::AuthServiceFactory};
 use actix_web::web::Data;
-use actix_web::{delete, get, post, web, App, HttpResponse, HttpServer};
+use actix_web::{delete, get, post, web, App, HttpRequest, HttpResponse, HttpServer};
 use async_trait::async_trait;
 use lazy_static::lazy_static;
 use log::debug;
@@ -14,9 +15,11 @@ use subvt_persistence::postgres::app::PostgreSQLAppStorage;
 use subvt_service_common::{err::InternalServerError, Service};
 use subvt_types::app::{
     NotificationPeriodType, User, UserNotificationChannel, UserNotificationRuleParameter,
-    UserValidator, PUBLIC_KEY_HEX_LENGTH,
+    UserValidator,
 };
 use subvt_types::err::ServiceError;
+
+mod auth;
 
 lazy_static! {
     static ref CONFIG: Config = Config::default();
@@ -27,18 +30,6 @@ type ResultResponse = Result<HttpResponse, InternalServerError>;
 #[derive(Clone)]
 pub struct ServiceState {
     pub postgres: Arc<PostgreSQLAppStorage>,
-}
-
-async fn check_user_exists_by_id(
-    state: &web::Data<ServiceState>,
-    user_id: u32,
-) -> anyhow::Result<Option<HttpResponse>> {
-    if !state.postgres.user_exists_by_id(user_id).await? {
-        return Ok(Some(
-            HttpResponse::NotFound().json(ServiceError::from("User not found.".to_string())),
-        ));
-    }
-    Ok(None)
 }
 
 /// `GET`s the list of networks supported by SubVT.
@@ -60,94 +51,83 @@ async fn get_notification_types(state: web::Data<ServiceState>) -> ResultRespons
 }
 
 /// Validates and creates a new user.
-#[post("/user")]
-async fn create_user(state: web::Data<ServiceState>, mut user: web::Json<User>) -> ResultResponse {
-    let public_key_hex = user.public_key_hex.trim_start_matches("0x").to_uppercase();
-    // validate public key hex length
-    if public_key_hex.len() != PUBLIC_KEY_HEX_LENGTH {
-        return Ok(HttpResponse::BadRequest().json(ServiceError::from(format!(
-            "Public key should be {} characters long hexadecimal string.",
-            PUBLIC_KEY_HEX_LENGTH
-        ))));
-    }
-    // validate hex format
-    if hex::decode(&public_key_hex).is_err() {
-        return Ok(HttpResponse::BadRequest().json(ServiceError::from(
-            "Public key should be valid hexadecimal string.".to_string(),
-        )));
-    }
-    user.public_key_hex = format!("0x{}", public_key_hex);
+#[post("/secure/user")]
+async fn create_user(state: web::Data<ServiceState>, request: HttpRequest) -> ResultResponse {
+    let public_key_hex = request
+        .headers()
+        .get("SubVT-Public-Key")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let public_key_hex = if !public_key_hex.starts_with("0x") {
+        format!("0x{}", public_key_hex.to_uppercase())
+    } else {
+        public_key_hex.to_uppercase()
+    };
     // check duplicate public key
     if state
         .postgres
-        .user_exists_with_public_key(&user.public_key_hex)
+        .user_exists_by_public_key(&public_key_hex)
         .await?
     {
         return Ok(HttpResponse::Conflict().json(ServiceError::from(
-            "A user exists with the given public key.".to_string(),
+            "A user exists with the given public key.",
         )));
     }
+    let mut user = User {
+        id: 0,
+        public_key_hex,
+    };
     user.id = state.postgres.save_user(&user).await?;
     Ok(HttpResponse::Created().json(user))
 }
 
-#[derive(Deserialize)]
-struct UserIdPathParameter {
-    pub user_id: u32,
-}
-
 /// `GET`s the list of notification channels that the user has created for herself so far.
-#[get("/user/{user_id}/notification/channel")]
+#[get("/secure/user/notification/channel")]
 async fn get_user_notification_channels(
-    path_params: web::Path<UserIdPathParameter>,
     state: web::Data<ServiceState>,
+    auth: AuthenticatedUser,
 ) -> ResultResponse {
-    if let Some(error_response) = check_user_exists_by_id(&state, path_params.user_id).await? {
-        return Ok(error_response);
-    }
     Ok(HttpResponse::Ok().json(
         state
             .postgres
-            .get_user_notification_channels(path_params.user_id)
+            .get_user_notification_channels(auth.id)
             .await?,
     ))
 }
 
 /// Creates a new notification channel for the user.
-#[post("/user/{user_id}/notification/channel")]
+#[post("/secure/user/notification/channel")]
 async fn add_user_notification_channel(
-    path_params: web::Path<UserIdPathParameter>,
     mut input: web::Json<UserNotificationChannel>,
     state: web::Data<ServiceState>,
+    auth: AuthenticatedUser,
 ) -> ResultResponse {
-    input.user_id = path_params.user_id as u32;
-    if let Some(error_response) = check_user_exists_by_id(&state, input.user_id).await? {
-        return Ok(error_response);
-    }
+    input.user_id = auth.id;
     // check notification channel exists
     if !state
         .postgres
         .notification_channel_exists(&input.channel_code)
         .await?
     {
-        return Ok(HttpResponse::NotFound().json(ServiceError::from(
-            "Notification channel not found.".to_string(),
-        )));
+        return Ok(
+            HttpResponse::NotFound().json(ServiceError::from("Notification channel not found."))
+        );
     }
     if state
         .postgres
         .user_notification_channel_target_exists(&input)
         .await?
     {
-        return Ok(HttpResponse::Conflict().json(ServiceError::from(
-            "This target exists for the user.".to_string(),
-        )));
+        return Ok(
+            HttpResponse::Conflict().json(ServiceError::from("This target exists for the user."))
+        );
     }
     // validate input
     if input.target.is_empty() {
-        return Ok(HttpResponse::BadRequest().json(ServiceError::from(
-            "Invalid notification target.".to_string(),
-        )));
+        return Ok(
+            HttpResponse::BadRequest().json(ServiceError::from("Invalid notification target."))
+        );
     }
     input.id = state
         .postgres
@@ -157,117 +137,91 @@ async fn add_user_notification_channel(
 }
 
 #[derive(Deserialize)]
-struct UserNotificationChannelIdPathParameter {
-    pub user_id: u32,
-    pub channel_id: u32,
+struct IdPathParameter {
+    pub id: u32,
 }
 
 /// `DELETE`s the notification channel from the user's list of notification channels.
 /// A soft delete, but the user will no longer receive notifications on this channel.
-#[delete("/user/{user_id}/notification/channel/{channel_id}")]
+#[delete("/secure/user/notification/channel/{id}")]
 async fn delete_user_notification_channel(
-    path_params: web::Path<UserNotificationChannelIdPathParameter>,
+    path_params: web::Path<IdPathParameter>,
     state: web::Data<ServiceState>,
+    auth: AuthenticatedUser,
 ) -> ResultResponse {
     let channel_exists = state
         .postgres
-        .user_notification_channel_exists(path_params.user_id, path_params.channel_id)
+        .user_notification_channel_exists(auth.id, path_params.id)
         .await?;
     if !channel_exists {
-        return Ok(HttpResponse::NotFound().json(ServiceError::from(
-            "User notification channel not found.".to_string(),
-        )));
+        return Ok(HttpResponse::NotFound()
+            .json(ServiceError::from("User notification channel not found.")));
     }
     match state
         .postgres
-        .delete_user_notification_channel(path_params.channel_id)
+        .delete_user_notification_channel(path_params.id)
         .await?
     {
         true => Ok(HttpResponse::NoContent().finish()),
         false => Ok(HttpResponse::InternalServerError().json(ServiceError::from(
-            "There was an error deleting the notification channel.".to_string(),
+            "There was an error deleting the notification channel.",
         ))),
     }
 }
 
 /// `GET`s the list of all validators registered to the user.
-#[get("/user/{user_id}/validator")]
+#[get("/secure/user/validator")]
 async fn get_user_validators(
-    path_params: web::Path<UserIdPathParameter>,
     state: web::Data<ServiceState>,
+    auth: AuthenticatedUser,
 ) -> ResultResponse {
-    if let Some(error_response) = check_user_exists_by_id(&state, path_params.user_id).await? {
-        return Ok(error_response);
-    }
-    Ok(HttpResponse::Ok().json(
-        state
-            .postgres
-            .get_user_validators(path_params.user_id)
-            .await?,
-    ))
+    Ok(HttpResponse::Ok().json(state.postgres.get_user_validators(auth.id).await?))
 }
 
 /// Adds a new validator to the user's list of validators.
-#[post("/user/{user_id}/validator")]
+#[post("/secure/user/validator")]
 async fn add_user_validator(
-    path_params: web::Path<UserIdPathParameter>,
     mut input: web::Json<UserValidator>,
     state: web::Data<ServiceState>,
+    auth: AuthenticatedUser,
 ) -> ResultResponse {
-    input.user_id = path_params.user_id;
-    if let Some(error_response) = check_user_exists_by_id(&state, input.user_id).await? {
-        return Ok(error_response);
-    }
+    input.user_id = auth.id;
     // check network exists
     if !state
         .postgres
         .network_exists_by_id(input.network_id)
         .await?
     {
-        return Ok(
-            HttpResponse::NotFound().json(ServiceError::from("Network not found.".to_string()))
-        );
+        return Ok(HttpResponse::NotFound().json(ServiceError::from("Network not found.")));
     }
     // check user validator exists
     if state.postgres.user_validator_exists(&input).await? {
-        return Ok(
-            HttpResponse::Conflict().json(ServiceError::from("User validator exists.".to_string()))
-        );
+        return Ok(HttpResponse::Conflict().json(ServiceError::from("User validator exists.")));
     }
     input.id = state.postgres.save_user_validator(&input).await?;
     Ok(HttpResponse::Created().json(input))
 }
 
-#[derive(Deserialize)]
-struct UserValidatorIdPathParameter {
-    pub user_id: u32,
-    pub user_validator_id: u32,
-}
-
 /// `DELETE`s a validator from the user's list of validators.
 /// A soft delete, i.e. only marks the validator as deleted.
-#[delete("/user/{user_id}/validator/{user_validator_id}")]
+#[delete("/secure/user/validator/{id}")]
 async fn delete_user_validator(
-    path_params: web::Path<UserValidatorIdPathParameter>,
+    path_params: web::Path<IdPathParameter>,
     state: web::Data<ServiceState>,
+    auth: AuthenticatedUser,
 ) -> ResultResponse {
     // check validator exists
     if !state
         .postgres
-        .user_validator_exists_by_id(path_params.user_id, path_params.user_validator_id)
+        .user_validator_exists_by_id(auth.id, path_params.id)
         .await?
     {
-        return Ok(HttpResponse::NotFound()
-            .json(ServiceError::from("User validator not found.".to_string())));
+        return Ok(HttpResponse::NotFound().json(ServiceError::from("User validator not found.")));
     }
-    match state
-        .postgres
-        .delete_user_validator(path_params.user_validator_id)
-        .await?
-    {
+    match state.postgres.delete_user_validator(path_params.id).await? {
         true => Ok(HttpResponse::NoContent().finish()),
         false => Ok(HttpResponse::InternalServerError().json(ServiceError::from(
-            "There was an error deleting the user's validator.".to_string(),
+            "There was an error deleting the user's validator.",
         ))),
     }
 }
@@ -287,49 +241,36 @@ struct CreateUserNotificationRuleRequest {
 }
 
 /// `GET`s the list of the user's non-deleted notification rules.
-#[get("/user/{user_id}/notification/rule")]
+#[get("/secure/user/notification/rule")]
 async fn get_user_notification_rules(
-    path_params: web::Path<UserIdPathParameter>,
     state: web::Data<ServiceState>,
+    auth: AuthenticatedUser,
 ) -> ResultResponse {
-    if let Some(error_response) = check_user_exists_by_id(&state, path_params.user_id).await? {
-        return Ok(error_response);
-    }
-    Ok(HttpResponse::Ok().json(
-        state
-            .postgres
-            .get_user_notification_rules(path_params.user_id)
-            .await?,
-    ))
+    Ok(HttpResponse::Ok().json(state.postgres.get_user_notification_rules(auth.id).await?))
 }
 
 /// Creates a new notification rule for the user. The new rule starts getting evaluated for possible
 /// notifications as soon as it gets created.
-#[post("/user/{user_id}/notification/rule")]
+#[post("/secure/user/notification/rule")]
 async fn create_user_notification_rule(
-    path_params: web::Path<UserIdPathParameter>,
     mut input: web::Json<CreateUserNotificationRuleRequest>,
     state: web::Data<ServiceState>,
+    auth: AuthenticatedUser,
 ) -> ResultResponse {
-    if let Some(error_response) = check_user_exists_by_id(&state, path_params.user_id).await? {
-        return Ok(error_response);
-    }
     // check notification type exists
     if !state
         .postgres
         .notification_type_exists_by_code(&input.notification_type_code)
         .await?
     {
-        return Ok(HttpResponse::NotFound().json(ServiceError::from(
-            "Notification type not found.".to_string(),
-        )));
+        return Ok(
+            HttpResponse::NotFound().json(ServiceError::from("Notification type not found."))
+        );
     }
     // check network exists
     if let Some(network_id) = input.network_id {
         if !state.postgres.network_exists_by_id(network_id).await? {
-            return Ok(
-                HttpResponse::NotFound().json(ServiceError::from("Network not found.".to_string()))
-            );
+            return Ok(HttpResponse::NotFound().json(ServiceError::from("Network not found.")));
         }
     }
     // check validators
@@ -337,35 +278,35 @@ async fn create_user_notification_rule(
         input.user_validator_ids.clear();
     } else if input.user_validator_ids.is_empty() {
         return Ok(HttpResponse::BadRequest().json(ServiceError::from(
-            "At least 1 user validator should be selected.".to_string(),
+            "At least 1 user validator should be selected.",
         )));
     }
     for user_validator_id in &input.user_validator_ids {
         if !state
             .postgres
-            .user_validator_exists_by_id(path_params.user_id, *user_validator_id)
+            .user_validator_exists_by_id(auth.id, *user_validator_id)
             .await?
         {
-            return Ok(HttpResponse::NotFound()
-                .json(ServiceError::from("User validator not found.".to_string())));
+            return Ok(
+                HttpResponse::NotFound().json(ServiceError::from("User validator not found."))
+            );
         }
     }
     // check if there is at least one notification channel
     if input.user_notification_channel_ids.is_empty() {
         return Ok(HttpResponse::BadRequest().json(ServiceError::from(
-            "There should be at least 1 notification channel selected.".to_string(),
+            "There should be at least 1 notification channel selected.",
         )));
     }
     // check user notification channel ids
     for user_notification_channel_id in &input.user_notification_channel_ids {
         if !state
             .postgres
-            .user_notification_channel_exists(path_params.user_id, *user_notification_channel_id)
+            .user_notification_channel_exists(auth.id, *user_notification_channel_id)
             .await?
         {
-            return Ok(HttpResponse::NotFound().json(ServiceError::from(
-                "User notification channel not found.".to_string(),
-            )));
+            return Ok(HttpResponse::NotFound()
+                .json(ServiceError::from("User notification channel not found.")));
         }
     }
     let notification_parameter_types = state
@@ -383,10 +324,13 @@ async fn create_user_notification_rule(
         .filter(|id| !notification_parameter_type_ids.contains(id))
         .collect();
     if !irrelevant_parameter_type_ids.is_empty() {
-        return Ok(HttpResponse::NotFound().json(ServiceError::from(format!(
-            "Posted parameter(s) with id(s) {:?} not found for notification type '{}'.",
-            irrelevant_parameter_type_ids, input.notification_type_code
-        ))));
+        return Ok(HttpResponse::NotFound().json(ServiceError::from(
+            format!(
+                "Posted parameter(s) with id(s) {:?} not found for notification type '{}'.",
+                irrelevant_parameter_type_ids, input.notification_type_code
+            )
+            .as_ref(),
+        )));
     }
     let posted_parameter_type_ids: Vec<u32> = input
         .parameters
@@ -402,10 +346,13 @@ async fn create_user_notification_rule(
         .map(|parameter_type| parameter_type.id)
         .collect();
     if !missing_non_optional_parameter_type_ids.is_empty() {
-        return Ok(HttpResponse::BadRequest().json(ServiceError::from(format!(
-            "Missing non-optional parameter type ids: {:?}",
-            missing_non_optional_parameter_type_ids
-        ))));
+        return Ok(HttpResponse::BadRequest().json(ServiceError::from(
+            format!(
+                "Missing non-optional parameter type ids: {:?}",
+                missing_non_optional_parameter_type_ids
+            )
+            .as_ref(),
+        )));
     }
     // validate parameters
     for parameter in &input.parameters {
@@ -414,16 +361,19 @@ async fn create_user_notification_rule(
             .find(|parameter_type| parameter_type.id == parameter.parameter_type_id)
             .unwrap();
         if let (false, Some(validation_error_message)) = parameter.validate(parameter_type) {
-            return Ok(HttpResponse::BadRequest().json(ServiceError::from(format!(
-                "Invalid '{}': {}",
-                parameter_type.code, validation_error_message
-            ))));
+            return Ok(HttpResponse::BadRequest().json(ServiceError::from(
+                format!(
+                    "Invalid '{}': {}",
+                    parameter_type.code, validation_error_message
+                )
+                .as_ref(),
+            )));
         }
     }
     let rule_id = state
         .postgres
         .save_user_notification_rule(
-            path_params.user_id,
+            auth.id,
             &input.notification_type_code,
             (input.name.as_deref(), input.notes.as_deref()),
             (input.network_id, input.is_for_all_validators),
@@ -444,41 +394,33 @@ async fn create_user_notification_rule(
     ))
 }
 
-#[derive(Deserialize)]
-struct UserNotificationRuleIdPathParameter {
-    pub user_id: u32,
-    pub user_notification_rule_id: u32,
-}
-
 /// `DELETE` a rule from the list of the user's notification rules.
 /// A soft delete, the rule will not be able to generate new notifications as soon as
 /// it gets deleted.
-#[delete("/user/{user_id}/notification/rule/{user_notification_rule_id}")]
+#[delete("/secure/user/notification/rule/{id}")]
 async fn delete_user_notification_rule(
-    path_params: web::Path<UserNotificationRuleIdPathParameter>,
+    path_params: web::Path<IdPathParameter>,
     state: web::Data<ServiceState>,
+    auth: AuthenticatedUser,
 ) -> ResultResponse {
     // check rule exists
     if !state
         .postgres
-        .user_notification_rule_exists_by_id(
-            path_params.user_id,
-            path_params.user_notification_rule_id,
-        )
+        .user_notification_rule_exists_by_id(auth.id, path_params.id)
         .await?
     {
-        return Ok(HttpResponse::NotFound().json(ServiceError::from(
-            "User notification rule not found.".to_string(),
-        )));
+        return Ok(
+            HttpResponse::NotFound().json(ServiceError::from("User notification rule not found."))
+        );
     }
     match state
         .postgres
-        .delete_user_notification_rule(path_params.user_notification_rule_id)
+        .delete_user_notification_rule(path_params.id)
         .await?
     {
         true => Ok(HttpResponse::NoContent().finish()),
         false => Ok(HttpResponse::InternalServerError().json(ServiceError::from(
-            "There was an error deleting the user notification rule.".to_string(),
+            "There was an error deleting the user notification rule.",
         ))),
     }
 }
@@ -506,10 +448,12 @@ impl Service for AppService {
                 .app_data(web::JsonConfig::default().error_handler(|err, _req| {
                     actix_web::error::InternalError::from_response(
                         "",
-                        HttpResponse::BadRequest().json(ServiceError::from(format!("{}", err))),
+                        HttpResponse::BadRequest()
+                            .json(ServiceError::from(format!("{}", err).as_ref())),
                     )
                     .into()
                 }))
+                .wrap(AuthServiceFactory {})
                 .service(get_networks)
                 .service(get_notification_channels)
                 .service(get_notification_types)

@@ -29,6 +29,7 @@ pub mod event;
 pub mod extrinsic;
 pub mod legacy;
 pub mod metadata;
+pub mod paras;
 
 #[derive(Default)]
 pub struct LastRuntimeUpgradeInfo {
@@ -197,10 +198,7 @@ impl BlockHeader {
         Ok(number)
     }
 
-    fn authority_index_from_log_bytes(
-        consensus_engine: &str,
-        bytes: &mut Vec<u8>,
-    ) -> Option<usize> {
+    fn authority_index_from_log_bytes(consensus_engine: &str, bytes: &mut [u8]) -> Option<usize> {
         match consensus_engine {
             "BABE" => {
                 let mut data_vec_bytes: &[u8] = &bytes[..];
@@ -325,11 +323,11 @@ pub struct Epoch {
 
 impl Epoch {
     pub fn get_start_date_time(&self) -> DateTime<Utc> {
-        Utc::timestamp(&Utc, self.start_timestamp as i64, 0)
+        Utc::timestamp(&Utc, self.start_timestamp as i64 / 1000, 0)
     }
 
     pub fn get_end_date_time(&self) -> DateTime<Utc> {
-        Utc::timestamp(&Utc, self.end_timestamp as i64, 0)
+        Utc::timestamp(&Utc, self.end_timestamp as i64 / 1000, 0)
     }
 }
 

@@ -18,6 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use subvt_config::Config;
 use subvt_types::crypto::AccountId;
+use subvt_types::substrate::paras::ParaCoreAssignment;
 use subvt_types::substrate::{
     event::SubstrateEvent, extrinsic::SubstrateExtrinsic, legacy::LegacyValidatorPrefs,
     metadata::Metadata, Account, Balance, Block, BlockHeader, BlockWrapper, Chain, Epoch, Era,
@@ -202,7 +203,8 @@ impl SubstrateClient {
                 get_rpc_storage_plain_params("Babe", "EpochIndex", Some(block_hash)),
             )
             .await?;
-        Ok(decode_hex_string(hex_string.as_str())?)
+        let index = decode_hex_string(hex_string.as_str())?;
+        Ok(index)
     }
 
     /// Get current epoch at the given block.
@@ -219,7 +221,7 @@ impl SubstrateClient {
             decode_hex_string::<(u32, u32)>(hex_string.as_str())?.1
         };
         let start_block_hash = self.get_block_hash(start_block_number as u64).await?;
-        let start_timestamp_millis: u64 = {
+        let start_timestamp: u64 = {
             let hex_string: String = self
                 .ws_client
                 .request(
@@ -233,10 +235,7 @@ impl SubstrateClient {
                 .await?;
             decode_hex_string(hex_string.as_str())?
         };
-        let start_timestamp = start_timestamp_millis / 1000;
-        let end_timestamp_millis =
-            start_timestamp_millis + self.metadata.constants.epoch_duration_millis;
-        let end_timestamp = end_timestamp_millis / 1000;
+        let end_timestamp = start_timestamp + self.metadata.constants.epoch_duration_millis;
         Ok(Epoch {
             index,
             start_block_number,
@@ -406,7 +405,8 @@ impl SubstrateClient {
                 get_rpc_storage_plain_params("Session", "Validators", Some(block_hash)),
             )
             .await?;
-        Ok(decode_hex_string(hex_string.as_str())?)
+        let account_ids = decode_hex_string(hex_string.as_str())?;
+        Ok(account_ids)
     }
 
     /// Maps the given accounts ids to tuples that contain the parent account id and child display.
@@ -595,28 +595,52 @@ impl SubstrateClient {
         {
             let active_validator_account_ids =
                 self.get_active_validator_account_ids(block_hash).await?;
-            /*
-             * for complete parachain assignment data:
-             *
-             * parasShared.currentSessionIndex
-             * paraScheduler.validatorGroups
-             * paraScheduler.scheduled
-             */
-            trace!("Get parachain validator account ids.");
-            let parachain_validator_account_ids = {
-                let mut account_ids = Vec::new();
-                let parachain_validator_indices = self
-                    .get_parachain_active_validator_indices(block_hash)
-                    .await?;
-                for index in parachain_validator_indices {
-                    if let Some(account_id) = active_validator_account_ids.get(index as usize) {
-                        account_ids.push(account_id.clone());
-                    } else {
-                        error!("Cannot find parachain validator index {}.", index);
+            debug!("Get para validators and core assignments.");
+            let mut para_core_assignment_map: HashMap<AccountId, Option<ParaCoreAssignment>> =
+                HashMap::new();
+            if let Some(para_validator_indices) =
+                self.get_paras_active_validator_indices(block_hash).await?
+            {
+                let para_validator_index_map = {
+                    let mut map: HashMap<u32, AccountId> = HashMap::new();
+                    for (para_validator_index, validator_index) in
+                        para_validator_indices.iter().enumerate()
+                    {
+                        if let Some(account_id) =
+                            active_validator_account_ids.get(*validator_index as usize)
+                        {
+                            para_core_assignment_map.insert(account_id.clone(), None);
+                            map.insert(para_validator_index as u32, account_id.clone());
+                        }
+                    }
+                    map
+                };
+                let para_validator_group_map = {
+                    let mut map: HashMap<u32, Vec<AccountId>> = HashMap::new();
+                    let para_validator_groups = self.get_para_validator_groups(block_hash).await?;
+                    for (group_index, group) in para_validator_groups.iter().enumerate() {
+                        map.insert(
+                            group_index as u32,
+                            group
+                                .iter()
+                                .filter_map(|index| para_validator_index_map.get(index))
+                                .cloned()
+                                .collect(),
+                        );
+                    }
+                    map
+                };
+                let para_core_assignments = self.get_para_core_assignments(block_hash).await?;
+                for assignment in &para_core_assignments {
+                    if let Some(group) = para_validator_group_map.get(&assignment.group_index) {
+                        for account_id in group {
+                            para_core_assignment_map
+                                .insert(account_id.clone(), Some(assignment.clone()));
+                        }
                     }
                 }
-                account_ids
             };
+            debug!("Get accounts.");
             let account_ids: Vec<AccountId> = all_keys
                 .iter()
                 .map(|key| self.account_id_from_storage_key_string(key))
@@ -624,16 +648,20 @@ impl SubstrateClient {
             let accounts = self.get_accounts(&account_ids, block_hash).await?;
             for account in accounts {
                 let is_active = active_validator_account_ids.contains(&account.id);
+                let is_para_validator =
+                    is_active && para_core_assignment_map.contains_key(&account.id);
+                let para_core_assignment = if is_para_validator {
+                    para_core_assignment_map.get(&account.id).unwrap().clone()
+                } else {
+                    None
+                };
                 validator_map.insert(
                     account.id.clone(),
                     ValidatorDetails {
                         account: account.clone(),
                         is_active,
-                        is_parachain_validator: if is_active {
-                            Some(parachain_validator_account_ids.contains(&account.id))
-                        } else {
-                            None
-                        },
+                        is_para_validator,
+                        para_core_assignment,
                         ..Default::default()
                     },
                 );
@@ -641,7 +669,7 @@ impl SubstrateClient {
         }
         // get next session keys
         {
-            debug!("Get session keys for all validators.");
+            debug!("Get session keys.");
             let keys: Vec<String> = validator_map
                 .values()
                 .map(|validator| {
@@ -1024,7 +1052,8 @@ impl SubstrateClient {
             Some(block_hash),
         );
         let hex_string: String = self.ws_client.request("state_getStorage", params).await?;
-        Ok(decode_hex_string(hex_string.as_str())?)
+        let reward_points = decode_hex_string(hex_string.as_str())?;
+        Ok(reward_points)
     }
 
     /// Get the session index at the given block.
@@ -1076,9 +1105,8 @@ impl SubstrateClient {
                 get_rpc_storage_plain_params("System", "LastRuntimeUpgrade", Some(block_hash)),
             )
             .await?;
-        Ok(LastRuntimeUpgradeInfo::from_substrate_hex_string(
-            hex_string,
-        )?)
+        let upgrade_info = LastRuntimeUpgradeInfo::from_substrate_hex_string(hex_string)?;
+        Ok(upgrade_info)
     }
 
     /// Figure the account id of the owner of an imonline key at a given block.
@@ -1098,19 +1126,51 @@ impl SubstrateClient {
         );
         let account_id_hex_string: String =
             self.ws_client.request("state_getStorage", params).await?;
-        Ok(decode_hex_string(&account_id_hex_string)?)
+        let account_id = decode_hex_string(&account_id_hex_string)?;
+        Ok(account_id)
     }
 
     /// Get the indices of the paravalidators at the given block.
-    pub async fn get_parachain_active_validator_indices(
+    pub async fn get_paras_active_validator_indices(
         &self,
         block_hash: &str,
-    ) -> anyhow::Result<Vec<u32>> {
+    ) -> anyhow::Result<Option<Vec<u32>>> {
         let params =
             get_rpc_storage_plain_params("ParasShared", "ActiveValidatorIndices", Some(block_hash));
-        let indices_vector_hex_string: String =
+        let maybe_indices_vector_hex_string: Option<String> =
             self.ws_client.request("state_getStorage", params).await?;
-        Ok(decode_hex_string(&indices_vector_hex_string)?)
+        if let Some(indices_vector_hex_string) = maybe_indices_vector_hex_string {
+            Ok(Some(decode_hex_string(&indices_vector_hex_string)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get parachain validator groups. Indices here are the indices of the result of the
+    /// `get_parachain_active_validator_indices` call.
+    pub async fn get_para_validator_groups(
+        &self,
+        block_hash: &str,
+    ) -> anyhow::Result<Vec<Vec<u32>>> {
+        let params =
+            get_rpc_storage_plain_params("ParaScheduler", "ValidatorGroups", Some(block_hash));
+        let group_double_vector_hex_string: String =
+            self.ws_client.request("state_getStorage", params).await?;
+        let groups = decode_hex_string(&group_double_vector_hex_string)?;
+        Ok(groups)
+    }
+
+    pub async fn get_para_core_assignments(
+        &self,
+        block_hash: &str,
+    ) -> anyhow::Result<Vec<ParaCoreAssignment>> {
+        let params = get_rpc_storage_plain_params("ParaScheduler", "Scheduled", Some(block_hash));
+        let availability_core_vector_hex_string: String =
+            self.ws_client.request("state_getStorage", params).await?;
+        let assignments = ParaCoreAssignment::from_core_assignment_vector_hex_string(
+            &availability_core_vector_hex_string,
+        )?;
+        Ok(assignments)
     }
 
     /// Validator preferences map at a given block.

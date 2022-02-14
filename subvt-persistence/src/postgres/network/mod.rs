@@ -127,6 +127,26 @@ impl PostgreSQLNetworkStorage {
         }
     }
 
+    pub async fn save_epoch(&self, index: u64, era_index: u32) -> anyhow::Result<Option<i64>> {
+        let maybe_result: Option<(i64,)> = sqlx::query_as(
+            r#"
+            INSERT INTO sub_epoch (index, era_index)
+            VALUES ($1, $2)
+            ON CONFLICT (index) DO NOTHING
+            RETURNING index
+            "#,
+        )
+        .bind(index as i64)
+        .bind(era_index)
+        .fetch_optional(&self.connection_pool)
+        .await?;
+        if let Some(result) = maybe_result {
+            Ok(Some(result.0))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn save_era_validators(
         &self,
         era_index: u32,
@@ -227,13 +247,48 @@ impl PostgreSQLNetworkStorage {
                     ON CONFLICT (era_index, validator_account_id, nominator_account_id) DO NOTHING
                     "#,
                 )
-                    .bind(era_stakers.era.index)
-                    .bind(validator_stake.account.id.to_string())
-                    .bind(nominator_stake.account.id.to_string())
-                    .bind(nominator_stake.stake.to_string())
-                    .execute(&mut transaction)
-                    .await?;
+                .bind(era_stakers.era.index)
+                .bind(validator_stake.account.id.to_string())
+                .bind(nominator_stake.account.id.to_string())
+                .bind(nominator_stake.stake.to_string())
+                .execute(&mut transaction)
+                .await?;
             }
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn save_session_para_validators(
+        &self,
+        era_index: u32,
+        session_index: u64,
+        validator_account_ids: &Vec<&AccountId>,
+    ) -> anyhow::Result<()> {
+        let mut transaction = self.connection_pool.begin().await?;
+        for validator_account_id in validator_account_ids {
+            sqlx::query(
+                r#"
+                INSERT INTO sub_account (id)
+                VALUES ($1)
+                ON CONFLICT (id) DO NOTHING
+                "#,
+            )
+            .bind(validator_account_id.to_string())
+            .execute(&mut transaction)
+            .await?;
+            sqlx::query(
+                r#"
+                    INSERT INTO sub_session_para_validator (era_index, session_index, validator_account_id)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (session_index, validator_account_id) DO NOTHING
+                    "#,
+            )
+            .bind(era_index)
+            .bind(session_index as i64)
+            .bind(validator_account_id.to_string())
+            .execute(&mut transaction)
+            .await?;
         }
         transaction.commit().await?;
         Ok(())
@@ -646,6 +701,8 @@ impl PostgreSQLNetworkStorage {
     pub async fn save_new_account_event(
         &self,
         block_hash: &str,
+        block_number: u64,
+        block_timestamp: Option<u64>,
         extrinsic_index: Option<i32>,
         event_index: i32,
         account_id: &AccountId,
@@ -670,12 +727,14 @@ impl PostgreSQLNetworkStorage {
         // update account
         let maybe_result: Option<(String,)> = sqlx::query_as(
             r#"
-            UPDATE sub_account SET discovered_at_block_hash = $1, updated_at = now()
-            WHERE id = $2
+            UPDATE sub_account SET discovered_at_block_hash = $1, discovered_at_block_number = $2, discovered_at = $3, updated_at = now()
+            WHERE id = $4
             RETURNING id
             "#,
         )
         .bind(block_hash)
+        .bind(block_number as i64)
+        .bind(block_timestamp.map(|timestamp| timestamp as i64))
         .bind(account_id.to_string())
         .fetch_optional(&self.connection_pool)
         .await?;
@@ -689,6 +748,8 @@ impl PostgreSQLNetworkStorage {
     pub async fn save_killed_account_event(
         &self,
         block_hash: &str,
+        block_number: u64,
+        block_timestamp: Option<u64>,
         extrinsic_index: Option<i32>,
         event_index: i32,
         account_id: &AccountId,
@@ -713,12 +774,14 @@ impl PostgreSQLNetworkStorage {
         // update account
         let maybe_result: Option<(String,)> = sqlx::query_as(
             r#"
-            UPDATE sub_account SET killed_at_block_hash = $1, updated_at = now()
-            WHERE id = $2
+            UPDATE sub_account SET killed_at_block_hash = $1, discovered_at_block_number = $2, discovered_at = $3, updated_at = now()
+            WHERE id = $4
             RETURNING id
             "#,
         )
         .bind(block_hash)
+        .bind(block_number as i64)
+        .bind(block_timestamp.map(|timestamp| timestamp as i64))
         .bind(account_id.to_string())
         .fetch_optional(&self.connection_pool)
         .await?;
@@ -759,15 +822,15 @@ impl PostgreSQLNetworkStorage {
         }
     }
 
-    pub async fn get_processed_block_height(&self) -> anyhow::Result<i64> {
+    pub async fn get_processed_block_height(&self) -> anyhow::Result<u64> {
         let processed_block_height: (i64,) = sqlx::query_as(
             r#"
-            SELECT COALESCE(MAX(number), -1) from sub_block
+            SELECT COALESCE(MAX(number), 0) from sub_block
             "#,
         )
         .fetch_one(&self.connection_pool)
         .await?;
-        Ok(processed_block_height.0)
+        Ok(processed_block_height.0 as u64)
     }
 
     pub async fn save_batch_item_completed_event(

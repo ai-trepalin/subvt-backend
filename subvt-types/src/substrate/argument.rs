@@ -10,6 +10,7 @@ use crate::{
         ValidatorPreferences,
     },
 };
+use frame_support::traits::schedule::LookupError;
 use frame_support::{
     dispatch::{DispatchError, DispatchInfo, DispatchResult},
     traits::{
@@ -30,14 +31,15 @@ use pallet_im_online::sr25519::AuthorityId;
 use pallet_im_online::Heartbeat;
 use pallet_multisig::Timepoint;
 use pallet_scheduler::TaskAddress;
-use pallet_staking::{EraIndex, Exposure, ValidatorPrefs};
+use pallet_staking::{Exposure, ValidatorPrefs};
 use pallet_vesting::VestingInfo;
 use parity_scale_codec::{Compact, Decode, Input};
 use polkadot_core_primitives::{AccountIndex, CandidateHash, Hash, Header};
 use polkadot_primitives::v1::{
     Balance, BlockNumber, CandidateReceipt, CoreIndex, GroupIndex, HeadData, HrmpChannelId, Id,
-    InherentData, ValidationCode,
+    InherentData, ValidationCode, ValidationCodeHash, ValidatorSignature,
 };
+use polkadot_primitives::v2::PvfCheckStatement;
 use polkadot_runtime::MaxAdditionalFields;
 use polkadot_runtime_common::{
     auctions::AuctionIndex,
@@ -54,6 +56,8 @@ use sp_session::MembershipProof;
 use sp_staking::{offence::Kind, SessionIndex};
 
 pub type IdentificationTuple = (AccountId, Exposure<AccountId, Balance>);
+
+type EraIndex = u32;
 
 #[derive(Clone, Debug)]
 pub enum Argument {
@@ -153,6 +157,7 @@ pub enum ArgumentPrimitive {
     Percent(Percent),
     Perquintill(Perquintill),
     RewardDestination(RewardDestination),
+    SchedulerLookupError(LookupError),
     U8(u8),
     U8Array32([u8; 32]),
     U16(u16),
@@ -160,6 +165,7 @@ pub enum ArgumentPrimitive {
     U64(u64),
     _PhantomData,
     ProxyType(ProxyType),
+    PvfCheckStatement(PvfCheckStatement),
     ReadySolution(ReadySolution),
     ReferendumIndex(ReferendumIndex),
     RegistrarIndex(RegistrarIndex),
@@ -173,8 +179,10 @@ pub enum ArgumentPrimitive {
     SolutionOrSnapshotSize(SolutionOrSnapshotSize),
     StatementKind(StatementKind),
     ValidationCode(ValidationCode),
+    ValidationCodeHash(ValidationCodeHash),
     ValidatorIndex(ValidatorIndex),
     ValidatorPreferences(ValidatorPreferences),
+    ValidatorSignature(ValidatorSignature),
     VersionedMultiAssets(Box<xcm::VersionedMultiAssets>),
     VersionedMultiLocation(xcm::VersionedMultiLocation),
     VersionedXcm(Box<xcm::VersionedXcm<()>>),
@@ -397,6 +405,7 @@ generate_argument_primitive_decoder_impl! {[
     ("LeasePeriod", decode_parachain_lease_period_1, ParachainLeasePeriod),
     ("LeasePeriodOf<T>", decode_parachain_lease_period_2, ParachainLeasePeriod),
     ("Compact<LeasePeriodOf<T>>", decode_parachain_compact_lease_period, ParachainCompactLeasePeriod),
+    ("LookupError", decode_scheduler_lookup_error, SchedulerLookupError),
     ("MessageId", decode_parachain_ump_message_id, ParachainUMPMessageId),
     ("OverweightIndex", decode_parachain_ump_overweight_index, ParachainUMPOverweightIndex),
     ("Compact<T::Moment>", decode_compact_moment_1, CompactMoment),
@@ -411,6 +420,7 @@ generate_argument_primitive_decoder_impl! {[
     ("Perquintill", decode_perquintill, Perquintill),
     ("ProxyType", decode_proxy_type_1, ProxyType),
     ("T::ProxyType", decode_proxy_type_2, ProxyType),
+    ("PvfCheckStatement", decode_pvf_check_statement, PvfCheckStatement),
     ("ReadySolution<T::AccountId>", decode_ready_solution, ReadySolution),
     ("ReferendumIndex", decode_referendum_index, ReferendumIndex),
     ("RegistrarIndex", decode_registrar_index, RegistrarIndex),
@@ -426,7 +436,9 @@ generate_argument_primitive_decoder_impl! {[
     ("SolutionOrSnapshotSize", decode_solution_or_snapshot_size, SolutionOrSnapshotSize),
     ("StatementKind", decode_statement_kind, StatementKind),
     ("ValidationCode", decode_validation_code, ValidationCode),
+    ("ValidationCodeHash", decode_validation_code_hash, ValidationCodeHash),
     ("ValidatorIndex", decode_validation_index, ValidatorIndex),
+    ("ValidatorSignature", decode_validator_signature, ValidatorSignature),
     ("Box<VersionedMultiAssets>", decode_versioned_multi_assets_1, VersionedMultiAssets),
     ("VersionedMultiAssets", decode_versioned_multi_assets_2, VersionedMultiAssets),
     ("Box<VersionedMultiLocation>", decode_versioned_multi_location_1, VersionedMultiLocation),
@@ -614,6 +626,7 @@ impl Argument {
                     || name == "CompactAssignments"
                     || name == "Box<T::PalletsOrigin>"
                     || name == "ChangesTrieConfiguration"
+                    || name == "Box<CallOrHashOf<T>>"
                 {
                     Err(ArgumentDecodeError::UnsupportedPrimitiveType(
                         name.to_string(),

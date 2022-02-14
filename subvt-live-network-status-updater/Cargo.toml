@@ -11,11 +11,11 @@ chrono = "0.4.19"
 lazy_static = "1.4.0"
 log = "0.4.14"
 redis = "0.21.2"
-serde = { version = "1.0.133", features = ["derive"] }
-serde_json = "1.0.74"
+serde = { version = "1.0.136", features = ["derive"] }
+serde_json = "1.0.78"
 subvt-config = { path = "../subvt-config" }
 subvt-logging = { path = "../subvt-logging" }
 subvt-service-common = { path = "../subvt-service-common" }
 subvt-substrate-client = { path = "../subvt-substrate-client" }
 subvt-types = { path = "../subvt-types" }
-tokio = { version = "1.15.0", features = ["full"] }
+tokio = { version = "1.16.1", features = ["full"] }
